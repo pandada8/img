@@ -54,6 +54,8 @@ type SnapshotterConfig struct {
 	asyncRemove bool
 }
 
+var tmpfsLocationKey = "label.overlayfs.tmpfs"
+
 // Opt is an option to configure the overlay snapshotter
 type Opt func(config *SnapshotterConfig) error
 
@@ -70,6 +72,8 @@ type snapshotter struct {
 	root        string
 	ms          *storage.MetaStore
 	asyncRemove bool
+	tmpRoot     string
+	useTmpfs    bool
 }
 
 // NewSnapshotter returns a Snapshotter which uses overlayfs. The overlayfs
@@ -98,15 +102,25 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		return nil, err
 	}
 
+	var ret = &snapshotter{
+		root:        root,
+		ms:          ms,
+		asyncRemove: config.asyncRemove,
+	}
+
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 
-	return &snapshotter{
-		root:        root,
-		ms:          ms,
-		asyncRemove: config.asyncRemove,
-	}, nil
+	ret.tmpRoot, ret.useTmpfs = os.LookupEnv("CONTAINERD_OVERLAYFS_TMPFS")
+
+	if ret.useTmpfs {
+		if err := os.Mkdir(filepath.Join(ret.tmpRoot, "snapshots"), 0700); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+	}
+
+	return ret, nil
 }
 
 // Stat returns the info for an active or committed snapshot by name or
@@ -165,7 +179,7 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, e
 		return snapshots.Usage{}, err
 	}
 
-	upperPath := o.upperPath(id)
+	upperPath := o.upperPathByInfo(info, id)
 
 	if info.Kind == snapshots.KindActive {
 		du, err := fs.DiskUsage(ctx, upperPath)
@@ -202,7 +216,7 @@ func (o *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get active mount")
 	}
-	return o.mounts(s), nil
+	return o.mounts(ctx, s), nil
 }
 
 func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
@@ -373,7 +387,17 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}()
 
-	snapshotDir := filepath.Join(o.root, "snapshots")
+	var (
+		snapshotDir string
+		tmp         bool
+	)
+	if kind == snapshots.KindActive && o.useTmpfs {
+		tmp = true
+		snapshotDir = filepath.Join(o.tmpRoot, "snapshots")
+	} else {
+		snapshotDir = filepath.Join(o.root, "snapshost")
+	}
+
 	td, err = o.prepareDirectory(ctx, snapshotDir, kind)
 	if err != nil {
 		if rerr := t.Rollback(); rerr != nil {
@@ -390,13 +414,20 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}()
 
+	if tmp {
+		opts = append(opts, func(info *snapshots.Info) error {
+			info.Labels[tmpfsLocationKey] = "true"
+			return nil
+		})
+	}
+
 	s, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create snapshot")
 	}
 
 	if len(s.ParentIDs) > 0 {
-		st, err := os.Stat(o.upperPath(s.ParentIDs[0]))
+		st, err := os.Stat(o.upperPathByCtx(ctx, s.ParentIDs[0]))
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to stat parent")
 		}
@@ -422,7 +453,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, errors.Wrap(err, "commit failed")
 	}
 
-	return o.mounts(s), nil
+	return o.mounts(ctx, s), nil
 }
 
 func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
@@ -444,7 +475,7 @@ func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 	return td, nil
 }
 
-func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
+func (o *snapshotter) mounts(ctx context.Context, s storage.Snapshot) []mount.Mount {
 	if len(s.ParentIDs) == 0 {
 		// if we only have one layer/no parents then just return a bind mount as overlay
 		// will not work
@@ -455,7 +486,7 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 
 		return []mount.Mount{
 			{
-				Source: o.upperPath(s.ID),
+				Source: o.upperPathByCtx(ctx, s.ID),
 				Type:   "bind",
 				Options: []string{
 					roFlag,
@@ -468,13 +499,13 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 
 	if s.Kind == snapshots.KindActive {
 		options = append(options,
-			fmt.Sprintf("workdir=%s", o.workPath(s.ID)),
-			fmt.Sprintf("upperdir=%s", o.upperPath(s.ID)),
+			fmt.Sprintf("workdir=%s", o.workPathByCtx(ctx, s.ID)),
+			fmt.Sprintf("upperdir=%s", o.upperPathByCtx(ctx, s.ID)),
 		)
 	} else if len(s.ParentIDs) == 1 {
 		return []mount.Mount{
 			{
-				Source: o.upperPath(s.ParentIDs[0]),
+				Source: o.upperPathByCtx(ctx, s.ParentIDs[0]),
 				Type:   "bind",
 				Options: []string{
 					"ro",
@@ -486,7 +517,7 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 
 	parentPaths := make([]string, len(s.ParentIDs))
 	for i := range s.ParentIDs {
-		parentPaths[i] = o.upperPath(s.ParentIDs[i])
+		parentPaths[i] = o.upperPathByCtx(ctx, s.ParentIDs[i])
 	}
 
 	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(parentPaths, ":")))
@@ -504,6 +535,33 @@ func (o *snapshotter) upperPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "fs")
 }
 
+func (o *snapshotter) upperPathByInfo(info snapshots.Info, id string) string {
+	if o.useTmpfs && onTmpfs(info) {
+		return filepath.Join(o.tmpRoot, "snapshots", id, "fs")
+	}
+	return o.upperPath(id)
+}
+
+func (o *snapshotter) upperPathByCtx(ctx context.Context, id string) string {
+	if o.useTmpfs {
+		_, info, _, _ := storage.GetInfo(ctx, id)
+		if onTmpfs(info) {
+			return filepath.Join(o.tmpRoot, "snapshots", id, "fs")
+		}
+	}
+	return o.upperPath(id)
+}
+
+func (o *snapshotter) workPathByCtx(ctx context.Context, id string) string {
+	if o.useTmpfs {
+		_, info, _, _ := storage.GetInfo(ctx, id)
+		if onTmpfs(info) {
+			return filepath.Join(o.tmpRoot, "snapshots", id, "work")
+		}
+	}
+	return o.workPath(id)
+}
+
 func (o *snapshotter) workPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "work")
 }
@@ -511,4 +569,11 @@ func (o *snapshotter) workPath(id string) string {
 // Close closes the snapshotter
 func (o *snapshotter) Close() error {
 	return o.ms.Close()
+}
+
+func onTmpfs(info snapshots.Info) bool {
+	if payload, ok := info.Labels[tmpfsLocationKey]; ok {
+		return payload == "true"
+	}
+	return false
 }
